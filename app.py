@@ -1,6 +1,7 @@
 import streamlit as st
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError, APIError
 from supabase import create_client
 import uuid
 import requests
@@ -135,8 +136,12 @@ if prompt:
             else:
                 # --- Text reply, optionally reasoning over an attached image ---
                 contents = [prompt, pil_image] if pil_image is not None else [prompt]
-                response = client.models.generate_content(model=TEXT_MODEL, contents=contents)
-                reply = response.text
+
+                try:
+                    response = client.models.generate_content(model=TEXT_MODEL, contents=contents)
+                    reply = response.text
+                except (ServerError, APIError):
+                    reply = "⚠️ The AI service is currently experiencing high load or a temporary outage. Please try sending your message again."
 
                 st.session_state.messages.append({"role": "model", "content": reply, "image": None})
                 st.write(reply)
