@@ -18,9 +18,10 @@ Given the constraint of zero cost, we will utilize open-source and free-tier too
 *   **Mock Chatbot Frontend:** Streamlit (Python) - Fast, free, and excellent for rapidly building AI chat interfaces.
 *   **Database:** Supabase (Free Tier, hosted Postgres) - Replaces the local SQLite file so both the Mock Chatbot and the n8n plugin can read/write the *same* conversation history over the network, from anywhere, without either service needing to be co-located. Supabase also gives you the `pgvector` extension, which means embedding storage and similarity math can eventually live in the database itself.
 *   **Workflow Automation / Integration (The "Plugin"):** n8n (Community Edition / Self-hosted or Free Cloud Tier) - Will handle the logic flow, database querying, and API routing.
-*   **LLM & Embedding Engine:** Google Gemini API (Free Tier) - Used for both generating chatbot responses and creating the text embeddings needed for trajectory analysis.
+*   **LLM & Embedding Engine:** Google Gemini API (Free Tier) - Used for both generating chatbot responses and creating the text embeddings needed for trajectory analysis. The chatbot uses the current unified `google-genai` SDK (the older `google-generativeai` package is deprecated), with `gemini-3.5-flash` for text and image-input understanding, and `gemini-2.5-flash-image` ("Nano Banana," free-tier) for image generation.
+*   **Image Storage:** Supabase Storage (same free project as the database) - Holds uploaded and AI-generated images as files, referenced by URL from the `conversations` table rather than storing binary data directly in Postgres.
 *   **Visualization Engine:** Plotly (via Streamlit) to display the semantic map, querying data live from Supabase.
-*   **Hosting:** Streamlit Community Cloud (frontend) + Render or Railway free tier (n8n backend) - so the whole stack runs online continuously instead of on your local machine.
+*   **Hosting:** Streamlit Community Cloud (frontend, always-on) + n8n run locally via Docker and exposed publicly through an ngrok tunnel (backend). n8n needs more RAM (1–2GB) than free cloud web-service tiers typically provide (e.g. Render's free tier gives 512MB, which isn't enough and causes out-of-memory crashes), so it runs on your own machine instead, active whenever you're building or demoing.
 
 ---
 
@@ -38,6 +39,8 @@ The goal here is to create a realistic testing environment that captures user in
       timestamp timestamptz default now(),
       role text not null,              -- "user" or "model"
       content text not null,
+      content_type text default 'text', -- 'text', 'image_input', or 'image_output'
+      image_url text,                  -- public Storage URL, only set on image rows
       embedding_vector jsonb,          -- stores the generated coordinates later
       flagged boolean default false    -- set by the n8n plugin on high-risk detection
     );
@@ -45,6 +48,8 @@ The goal here is to create a realistic testing environment that captures user in
 3.  (Optional but recommended) Enable the `pgvector` extension (Database → Extensions → search "vector") if you later want to store `embedding_vector` as a native `vector` type and run similarity queries directly in SQL instead of in n8n's Code node.
 4.  Because Supabase is a hosted service reachable over HTTPS, both the Streamlit app and the n8n workflow can talk to the *same* live database simultaneously — this is what makes Step 3.1's webhook trigger reliable, since n8n no longer needs file-level access to a local `.db` file.
 5.  For the hackathon demo, leave Row Level Security (RLS) off on this table so the Streamlit anon key and n8n can both read/write freely. Note in your pitch that production use would require RLS policies.
+6.  Create a Storage bucket to hold actual image files (the table only stores a URL, not the image bytes): click **Storage** in the left sidebar → **"New bucket"** → name it `conversation-images` → toggle **Public bucket** ON (acceptable for a demo; production would use signed URLs and RLS instead) → **"Create bucket"**.
+7.  **Important scope note:** `content_type` exists so the n8n plugin (Phase 3) can filter to `content_type = text` when fetching rows to embed. Images are not currently run through LSTT's semantic trajectory tracking — an uploaded or generated image is an unmonitored channel relative to the text-based danger-zone detection. This is worth stating explicitly as a known limitation / future-work item in your pitch, rather than leaving it implicit.
 
 ### Step 2.2: Frontend Development (Streamlit)
 1.  Set up a Python virtual environment and install dependencies (`streamlit`, `google-generativeai`, `supabase`).
@@ -59,6 +64,10 @@ The goal here is to create a realistic testing environment that captures user in
     *   Call the Gemini API (using your free API key) to get a response.
     *   *Crucially:* Write both the user prompt and the model response to the `conversations` table in Supabase under the current `session_id`, e.g. `supabase.table("conversations").insert({...}).execute()`.
     *   Immediately after inserting the user's message, call the n8n webhook (Step 3.1) so the plugin can process it right away.
+5.  **Multimodal support (image input and image output):**
+    *   Add a `st.file_uploader` so a user can attach an image; pass it alongside the text prompt into `generate_content()` so Gemini can see and reason about it.
+    *   Add a toggle for "generate an image instead of text," which calls the image-generation model (`gemini-2.5-flash-image`) with `response_modalities=["IMAGE"]` instead of the text model.
+    *   Any image involved (uploaded or generated) gets uploaded to the `conversation-images` Storage bucket, and its public URL is saved in the `image_url` column of the corresponding `conversations` row, with `content_type` set to `image_input` or `image_output` accordingly.
 
 ---
 
@@ -68,10 +77,10 @@ This is the core of the hackathon pitch. The n8n workflow will act as the middle
 
 ### Step 3.1: n8n Workflow Trigger
 1.  Set up an n8n workflow.
-2.  **Trigger:** Use a "Schedule" node (e.g., run every 10 seconds) OR set up a Webhook in n8n that your Streamlit app calls immediately after saving a new user message to Supabase. (Webhook is preferred for lower latency). Because both apps now talk to Supabase over the internet rather than a local file, this webhook works identically whether n8n and Streamlit are running on your laptop or fully deployed online (see Phase 6).
+2.  **Trigger:** Use a "Schedule" node (e.g., run every 10 seconds) OR set up a Webhook in n8n that your Streamlit app calls immediately after saving a new user message to Supabase. (Webhook is preferred for lower latency). Because both apps talk to Supabase over the internet rather than a local file, this webhook works the same way whether n8n is running on `localhost` or reached through the ngrok tunnel (see Phase 5) — only the URL changes.
 
 ### Step 3.2: Fetching Context & Generating Embeddings
-1.  **Supabase Node:** Configure this node (n8n has a built-in Supabase integration — just supply your Project URL and API key as credentials) to read the latest turns (e.g., the last 5 user messages) for the active `session_id` where `embedding_vector` is null.
+1.  **Supabase Node:** Configure this node (n8n has a built-in Supabase integration — just supply your Project URL and API key as credentials) to read the latest turns (e.g., the last 5 user messages) for the active `session_id` where `embedding_vector` is null **and** `content_type` equals `text`. The `content_type` filter is required now that image rows exist in the table — an image row's `content` field holds a caption/prompt rather than the full conversational text, and feeding it into the embedding step would quietly corrupt the trajectory math rather than fail loudly.
 2.  **HTTP Request Node (Gemini Embedding API):**
     *   Send the newly fetched user text to the Gemini embedding model (e.g., `text-embedding-004`).
     *   Retrieve the mathematical vector representation of the text.
@@ -105,36 +114,43 @@ Judges need to *see* the math working. You will build a dashboard that updates i
     *   Draw lines connecting Turn 1 -> Turn 2 -> Turn 3 to show the *path*.
     *   Plot a large, red "Danger Zone" circle on the graph representing the prohibited concepts.
     *   As the user types in the mock chat, the graph should dynamically update, showing their conversational dot moving closer to or further from the red zone.
+5.  **Image gallery:** Below the trajectory chart, query the same session's rows for any with a non-null `image_url` and display them with `st.image()` in a small grid, captioned by `content_type` (`image_input` vs `image_output`). This makes the unmonitored-image gap (see Phase 3.2) visible to judges rather than hidden — they can see an image was shared in the session even though it wasn't plotted on the trajectory graph.
 
 ---
 
-## Phase 5: Deploying Frontend & Backend Online
+## Phase 5: Deploying the Frontend & Running the Backend
 
-Running everything locally means restarting Streamlit and n8n every time you close your laptop or the process crashes. Deploying both online keeps the whole stack "always on" for the demo (and for judges to poke at afterward), and it's the natural payoff of moving to Supabase, since both services now just need internet access to the same database — not to each other's local filesystem.
+Streamlit Cloud can run the frontend "always on" for free. n8n is a different story: it needs more RAM (1–2GB, per n8n's own documentation) than free cloud web-service tiers typically provide — Render's free tier, for example, gives only 512MB, which causes n8n to crash with an out-of-memory error during startup regardless of which database it's pointed at. Rather than pay for a bigger server, n8n runs locally via Docker and is exposed with a free ngrok tunnel whenever it's needed for building or demoing.
 
 ### Step 6.1: Deploy the Streamlit Frontend (Streamlit Community Cloud — Free)
-1.  Push your project (the Streamlit app + `requirements.txt`) to a public or private GitHub repo. `requirements.txt` should include `streamlit`, `google-generativeai`, `supabase`, `plotly`, `scikit-learn`.
+1.  Push your project (the Streamlit app + `requirements.txt`) to a public or private GitHub repo. `requirements.txt` should include `streamlit`, `google-genai`, `supabase`, `plotly`, `scikit-learn`, `pillow`.
 2.  Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click "New app," pointing it at your repo and the main `.py` file.
 3.  **Secrets:** In the app's Settings → Secrets, add your credentials in TOML format so they're never hardcoded in the repo:
     ```toml
     SUPABASE_URL = "https://xxxx.supabase.co"
     SUPABASE_KEY = "your-anon-key"
     GEMINI_API_KEY = "your-gemini-key"
-    N8N_WEBHOOK_URL = "https://your-n8n-instance/webhook/xxxx"
+    N8N_WEBHOOK_URL = "https://your-name.ngrok-free.app/webhook/lstt"
     ```
 4.  Deploy. Streamlit Cloud will rebuild automatically on every push to your repo, so updates during the hackathon are just a `git push` away — no manual redeploy step.
 
-### Step 6.2: Deploy the n8n Backend (Render or Railway — Free Tier)
-1.  Both Render and Railway offer a one-click "Deploy n8n" template (search "n8n" in their template marketplaces), which spins up n8n as a persistent web service with a public HTTPS URL.
-2.  Set the required environment variables on the hosting platform (n8n will prompt for these): `N8N_BASIC_AUTH_ACTIVE`, `N8N_BASIC_AUTH_USER`, `N8N_BASIC_AUTH_PASSWORD` (to keep your workflow editor from being publicly open), and `WEBHOOK_URL` (set to the public URL Render/Railway assigns you).
-3.  Once deployed, open the hosted n8n editor, add your Supabase and Gemini credentials (Settings → Credentials), and rebuild the workflow from Phase 3 — the Webhook node will now expose a permanent public URL like `https://your-app.onrender.com/webhook/lstt-trigger`.
-4.  Copy that webhook URL into your Streamlit app's secrets (`N8N_WEBHOOK_URL`) so the deployed frontend can trigger the deployed backend.
-5.  **Free-tier caveat:** Render's free web services spin down after ~15 minutes of inactivity and take a few seconds to "wake up" on the next request — fine for a live demo where you're actively clicking, but worth mentioning to judges if there's a cold-start delay. Railway's free tier has a monthly usage cap instead of spin-down, so pick whichever trade-off suits your demo timing better.
+### Step 6.2: Run the n8n Backend Locally, Exposed via ngrok
+1.  Install Docker Desktop and run n8n in a container with a named volume, so workflows persist across restarts:
+    ```
+    docker volume create n8n_data
+    docker run -d --restart unless-stopped --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n -e N8N_BASIC_AUTH_ACTIVE=true -e N8N_BASIC_AUTH_USER=admin -e N8N_BASIC_AUTH_PASSWORD=your-password n8nio/n8n
+    ```
+2.  Install ngrok and claim the one free permanent **dev domain** every free account is automatically given — this keeps your public URL stable across restarts, unlike a random tunnel URL.
+3.  Start the tunnel: `ngrok http 5678 --url=https://your-name.ngrok-free.app`.
+4.  In the n8n editor (`localhost:5678` or the ngrok URL), add your Supabase and Gemini credentials and build the workflow from Phase 3 — the Webhook node exposes a path like `/webhook/lstt-trigger`, which combined with your ngrok domain becomes the full public webhook URL.
+5.  Copy that webhook URL into Streamlit's secrets (`N8N_WEBHOOK_URL`, both locally and on Streamlit Cloud) so the deployed frontend can reach the locally-running backend.
+6.  **Known limitation, stated plainly:** this backend is only reachable while your computer, Docker, and the ngrok tunnel are all running — it is not "walk away and it stays live" the way Streamlit Cloud is. That's an acceptable trade-off for a hackathon demo (you control when you present) but is worth noting explicitly to judges as a known constraint of the zero-budget prototype, with "a small always-on VPS with adequate RAM" as the natural next step for a production version.
+7.  Free ngrok tunnels inject a browser-warning interstitial on HTML-looking traffic, which can silently block the automated webhook call from Streamlit. Add a `ngrok-skip-browser-warning: true` header to that request in `app.py` to avoid this.
 
 ### Step 6.3: Verify the End-to-End Loop
-1.  Open your live Streamlit URL, send a test message, and confirm a new row appears in the Supabase `conversations` table.
-2.  Confirm the deployed n8n workflow fires (check the "Executions" tab in the n8n editor) and writes an `embedding_vector` back to that row.
-3.  Confirm the dashboard page picks up the new vector and plots it — this proves the full loop (Streamlit → Supabase → n8n → Supabase → Streamlit dashboard) works entirely online, with nothing running on your local machine.
+1.  With Docker and ngrok both running, open your live Streamlit URL, send a test message, and confirm a new row appears in the Supabase `conversations` table.
+2.  Confirm the n8n workflow fires (check the "Executions" tab in the local n8n editor) and writes an `embedding_vector` back to that row.
+3.  Confirm the dashboard page picks up the new vector and plots it — this proves the full loop (Streamlit Cloud → Supabase → local n8n via ngrok → Supabase → Streamlit dashboard) works end to end, with only the backend depending on your machine being on.
 
 ---
 
@@ -150,4 +166,18 @@ To win, structure your live demo as follows:
     *   Slowly escalate over 3-4 turns toward a dangerous request (e.g., "How can I maximize its explosive yield?").
 4.  **The Reveal:** Switch to the dashboard. Show the judges the line graph charting a direct, accelerating trajectory toward the "Danger Zone."
 5.  **The Intervention:** Show how your n8n plugin detected the velocity and automatically flagged/blocked the final prompt *before* the LLM could generate a harmful response, proving the viability of state-aware governance.
+
+---
+
+## Phase 7: Maintenance — Rotating the Gemini API Key
+
+Free-tier Gemini keys hit daily/per-minute quota limits (see Phase 2 and 3's known 404/429 issues), and you may also generate a fresh key if you suspect the old one leaked or want a clean quota reset. Because this project calls the Gemini API from **two separate places** — the Streamlit app and the n8n workflow — a new key has to be updated in **every** place it's referenced, or you'll get inconsistent behavior (e.g., chat replies work but the LSTT plugin silently fails, or vice versa).
+
+### Every location that stores the Gemini API key
+1. **Local secrets file** — `.streamlit/secrets.toml` → `GEMINI_API_KEY = "..."` (used when running `streamlit run app.py` on your own machine).
+2. **Streamlit Cloud secrets** — your deployed app's Settings → Secrets panel → `GEMINI_API_KEY = "..."` (used by the live, deployed frontend — this is a *separate* copy from your local file and does not sync automatically).
+3. **n8n's HTTP Request node ("Embedding" call)** — the key is embedded directly in the URL's query string (`?key=...`), not stored as a reusable n8n credential. This means it must be edited inside the node itself, not in a central credentials list.
+4. **Any local diagnostic/test scripts** you've created (e.g. a `list_models.py` used to check available models) — if these hardcode the key rather than reading from secrets, they'll also need manual updates.
+
+A key rotated in only one or two of these will produce confusing, partial failures — for example, the chatbot replying normally while the LSTT plugin quietly stops embedding new messages, since Streamlit and n8n fail independently and neither surfaces the other's errors. Treat key rotation as a single checklist covering all four locations, done in one sitting, followed by an end-to-end test (Phase 5's Step 6.3 verification) to confirm nothing was missed.
     
