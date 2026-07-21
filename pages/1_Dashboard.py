@@ -41,7 +41,7 @@ if st.button("Refresh"):
 
             # --- Fit PCA on current session vectors --
             pca = PCA(n_components=2)
-            coords = PCA(n_components=2).fit_transform(vectors)
+            coords = pca.fit_transform(vectors)
 
             # --- Project Danger Anchor into the exact same 2D coordinate space ---
             danger_coords = pca.transform([DANGER_ANCHOR])[0]
