@@ -40,98 +40,106 @@ if st.button("Refresh"):
                 for row in embedded_rows
             ]
 
-            # --- Fit PCA on current session vectors --
-            pca = PCA(n_components=2)
-            coords = pca.fit_transform(vectors)
+            expected_dim = len(DANGER_ANCHOR)
+            filtered = [(r, v) for r, v in zip(embedded_rows, vectors) if len(v) == expected_dim]
+            if len(filtered) < 2:
+                st.info("Not enough turns embedded at the current vector dimension yet. Send a new message and refresh.")
+            else:
+                embedded_rows, vectors = zip(*filtered)
+                embedded_rows, vectors = list(embedded_rows), list(vectors)
 
-            # --- Project Danger Anchor into the exact same 2D coordinate space ---
-            danger_coords = pca.transform([DANGER_ANCHOR])[0]
+                # --- Fit PCA on current session vectors --
+                pca = PCA(n_components=2)
+                coords = pca.fit_transform(vectors)
 
-            fig = go.Figure()
+                # --- Project Danger Anchor into the exact same 2D coordinate space ---
+                danger_coords = pca.transform([DANGER_ANCHOR])[0]
 
-            # --- 1. Draw the Danger Zone Target ---
-            fig.add_trace(go.Scatter(
-                x=[danger_coords[0]],
-                y=[danger_coords[1]],
-                mode="markers+text",
-                text=["Danger Zone"],
-                textposition="bottom center",
-                marker=dict(
-                    size=40,
-                    color="rgba(255, 0, 0, 0.25)",
-                    line=dict(color="red", width=2)
-                ),
-                name="Danger Zone",
-            ))
+                fig = go.Figure()
 
-            # --- 2. Draw Conversation Nodes (Dots and Text Only) ---
-            # Separated from lines so the dynamic colored lines render properly beneath
-            fig.add_trace(go.Scatter(
-                x=coords[:, 0],
-                y=coords[:, 1],
-                mode="markers+text",
-                text=[f"Turn {i + 1}" for i in range(len(coords))],
-                textposition="top center",
-                name="Conversation path",
-                marker=dict(size=8, color="#1f77b4")
-            ))
+                # --- 1. Draw the Danger Zone Target ---
+                fig.add_trace(go.Scatter(
+                    x=[danger_coords[0]],
+                    y=[danger_coords[1]],
+                    mode="markers+text",
+                    text=["Danger Zone"],
+                    textposition="bottom center",
+                    marker=dict(
+                        size=40,
+                        color="rgba(255, 0, 0, 0.25)",
+                        line=dict(color="red", width=2)
+                    ),
+                    name="Danger Zone",
+                ))
 
-            # --- 3. Dynamic Velocity-Colored Trajectory Lines ---
-            if len(coords) >= 2:
-                for i in range(len(coords) - 1):
-                    # Safely fetch velocity from embedded_rows, defaulting to 0.0
-                    raw_vel = embedded_rows[i+1].get('velocity')
-                    seg_velocity = float(raw_vel) if raw_vel is not None else 0.0
+                # --- 2. Draw Conversation Nodes (Dots and Text Only) ---
+                # Separated from lines so the dynamic colored lines render properly beneath
+                fig.add_trace(go.Scatter(
+                    x=coords[:, 0],
+                    y=coords[:, 1],
+                    mode="markers+text",
+                    text=[f"Turn {i + 1}" for i in range(len(coords))],
+                    textposition="top center",
+                    name="Conversation path",
+                    marker=dict(size=8, color="#1f77b4")
+                ))
+
+                # --- 3. Dynamic Velocity-Colored Trajectory Lines ---
+                if len(coords) >= 2:
+                    for i in range(len(coords) - 1):
+                        # Safely fetch velocity from embedded_rows, defaulting to 0.0
+                        raw_vel = embedded_rows[i+1].get('velocity')
+                        seg_velocity = float(raw_vel) if raw_vel is not None else 0.0
+                        
+                        # Calculate green-to-red gradient based on velocity
+                        r = min(255, max(0, int(128 + seg_velocity * 500)))
+                        g = min(255, max(0, int(128 - seg_velocity * 500)))
+                        color = f"rgba({r}, {g}, 80, 0.8)"
+                        
+                        fig.add_trace(go.Scatter(
+                            x=coords[i:i+2, 0], 
+                            y=coords[i:i+2, 1],
+                            mode="lines", 
+                            line=dict(color=color, width=3),
+                            showlegend=False,
+                            hoverinfo="skip" # Prevents messy tooltips between points
+                        ))
+
+                # --- 4. Projected Next Point (Visual Forecasting) ---
+                if len(coords) >= 2:
+                    last_row = embedded_rows[-1]
                     
-                    # Calculate green-to-red gradient based on velocity
-                    r = min(255, max(0, int(128 + seg_velocity * 500)))
-                    g = min(255, max(0, int(128 - seg_velocity * 500)))
-                    color = f"rgba({r}, {g}, 80, 0.8)"
+                    # Safely parse streak and velocity
+                    raw_streak = last_row.get('streak')
+                    raw_velocity = last_row.get('velocity')
+                    streak = int(raw_streak) if raw_streak is not None else 0
+                    velocity = float(raw_velocity) if raw_velocity is not None else 0.0
                     
-                    fig.add_trace(go.Scatter(
-                        x=coords[i:i+2, 0], 
-                        y=coords[i:i+2, 1],
-                        mode="lines", 
-                        line=dict(color=color, width=3),
-                        showlegend=False,
-                        hoverinfo="skip" # Prevents messy tooltips between points
-                    ))
+                    if streak >= 2 and velocity > 0:
+                        last_point = coords[-1]
+                        direction = coords[-1] - coords[-2]
+                        projected = last_point + direction  # naive one-step linear projection
+                        
+                        fig.add_trace(go.Scatter(
+                            x=[last_point[0], projected[0]], 
+                            y=[last_point[1], projected[1]],
+                            mode="lines+markers", 
+                            line=dict(color="orange", width=2, dash="dot"),
+                            marker=dict(symbol="star", size=10, color="orange"),
+                            name="Projected trajectory"
+                        ))
 
-            # --- 4. Projected Next Point (Visual Forecasting) ---
-            if len(coords) >= 2:
-                last_row = embedded_rows[-1]
-                
-                # Safely parse streak and velocity
-                raw_streak = last_row.get('streak')
-                raw_velocity = last_row.get('velocity')
-                streak = int(raw_streak) if raw_streak is not None else 0
-                velocity = float(raw_velocity) if raw_velocity is not None else 0.0
-                
-                if streak >= 2 and velocity > 0:
-                    last_point = coords[-1]
-                    direction = coords[-1] - coords[-2]
-                    projected = last_point + direction  # naive one-step linear projection
-                    
-                    fig.add_trace(go.Scatter(
-                        x=[last_point[0], projected[0]], 
-                        y=[last_point[1], projected[1]],
-                        mode="lines+markers", 
-                        line=dict(color="orange", width=2, dash="dot"),
-                        marker=dict(symbol="star", size=10, color="orange"),
-                        name="Projected trajectory"
-                    ))
+                # --- Layout Updates ---
+                fig.update_layout(
+                    xaxis_title="PCA Component 1",
+                    yaxis_title="PCA Component 2",
+                    showlegend=True
+                )
 
-            # --- Layout Updates ---
-            fig.update_layout(
-                xaxis_title="PCA Component 1",
-                yaxis_title="PCA Component 2",
-                showlegend=True
-            )
+                if any(row.get("flagged") for row in embedded_rows):
+                    st.error("This session was flagged as high risk by the LSTT plugin.")
 
-            if any(row.get("flagged") for row in embedded_rows):
-                st.error("This session was flagged as high risk by the LSTT plugin.")
-
-            st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Images shared in this session")
 if image_rows:
@@ -141,3 +149,4 @@ if image_rows:
             st.image(row["image_url"], caption=row.get("content_type", ""))
 else:
     st.caption("No images in this session yet.")
+
