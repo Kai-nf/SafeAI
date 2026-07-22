@@ -14,7 +14,7 @@ st.set_page_config(page_title="Mock Gemini Chat", page_icon="💬")
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
-TEXT_MODEL = "gemini-3.5-flash"
+TEXT_MODEL = "gemini-3.1-flash-lite"
 IMAGE_GEN_MODEL = "gemini-2.5-flash-image"  # "Nano Banana" — has a free tier
 BUCKET = "conversation-images"
 
