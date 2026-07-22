@@ -2,9 +2,12 @@ import json
 import os
 
 from google import genai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-OUTPUT_DIMENSIONALITY = 3072
+OUTPUT_DIMENSIONALITY = 768
 
 danger_examples = [
     # --- Physical Threats & Energetic Materials ---
